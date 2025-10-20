@@ -1,0 +1,452 @@
+import random
+import time
+import json
+import pickle
+import numpy as np
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torch import nn
+from tqdm import tqdm
+from torch.nn.utils.rnn import pad_sequence
+from dataloader import c2cDataset
+from DECOM_model import DECOM
+from utils import MaskedSoftmaxCELoss, DAMSMLoss, eval_bleu_rouge_meteor
+from collections import defaultdict
+import os
+
+seed = 12345
+
+
+def seed_everything(seed=seed):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+
+
+def get_parameter_number(model):
+    total_num = sum(p.numel() for p in model.parameters())
+    trainable_num = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return {'Total': total_num, 'Trainable': trainable_num}
+
+# -------------------------------------
+# 加载DataLoader，支持CFG
+# -------------------------------------
+def get_loaders(code_word2id, comment_word2id, dataset, max_code_len, max_comment_len, max_keywords_len,
+                batch_size=32, num_workers=0, pin_memory=False, use_cfg=False):
+    # 在c2cDataset中传入use_cfg参数来加载CFG
+    train_set = c2cDataset(code_word2id, comment_word2id, dataset, max_code_len, max_comment_len, max_keywords_len,
+                           'train', use_cfg)
+    valid_set = c2cDataset(code_word2id, comment_word2id,
+                           dataset, max_code_len, max_comment_len,
+                           max_keywords_len, 'valid', use_cfg)
+    test_set = c2cDataset(code_word2id, comment_word2id,
+                          dataset, max_code_len, max_comment_len,
+                          max_keywords_len, 'test', use_cfg)
+
+
+    train_loader = DataLoader(train_set,
+                              batch_size=batch_size,
+                              shuffle=True,
+                              collate_fn=train_set.collate_fn,
+                              num_workers=num_workers,
+                              pin_memory=pin_memory)
+    valid_loader = DataLoader(valid_set,
+                              batch_size=batch_size,
+                              shuffle=False,
+                              collate_fn=valid_set.collate_fn,
+                              num_workers=num_workers,
+                              pin_memory=pin_memory)
+    test_loader = DataLoader(test_set,
+                             batch_size=batch_size,
+                             collate_fn=test_set.collate_fn,
+                             shuffle=False,
+                             num_workers=num_workers,
+                             pin_memory=pin_memory)
+
+    return train_loader, valid_loader, test_loader
+
+# -------------------------------------
+# 训练函数: 多轮审议 + CFG
+# -------------------------------------
+def train_locally(model, seq2seq_loss, evaluator_loss, dataloader, bos_token, optimizer_list, epoch, cuda, max_iter_num, use_cfg):
+    losses_list = [[] for _ in range(max_iter_num + 1)]
+    model.train()
+
+    seed_everything(seed + epoch)
+    for data in tqdm(dataloader, desc=f"Epoch {epoch+1} Training"):
+        '''wj:# 解包数据，包含CFG'''
+        if use_cfg:
+            data = [d.to('cuda') if isinstance(d, torch.Tensor) else d for d in data]
+            (source_code, comment, template, keywords, cfg_adj, cfg_nodes,
+             source_code_len, comment_len, template_len, keywords_len, cfg_len,
+             ids) = data
+
+            # code_id = data[-1]
+            bos = torch.tensor([bos_token] * comment.size(0), device=comment.device).reshape(-1, 1)
+            comment_input = torch.cat([bos, comment[:, :-1]], 1)
+            comment_input_len = torch.add(comment_len, -1)
+            # share
+            source_code_enc, source_code_len = model.code_encoder(source_code, source_code_len)
+            keywords_enc, keywords_len = model.keyword_encoder(keywords, keywords_len)
+            cfg_enc, cfg_len = model.cfg_encoder(cfg_adj, cfg_nodes, cfg_len)
+            for iter_idx in range(max_iter_num):
+                # clear the grad
+                optimizer_list[iter_idx].zero_grad()
+
+                template_enc, template_len = model.template_encoder(template, template_len)
+                if iter_idx == 0:
+                    comment_pred = model.deliberation_dec[iter_idx](source_code_enc, comment_input, template_enc,
+                                                                    keywords_enc, source_code_len, template_len,
+                                                                    keywords_len, cfg_enc, cfg_len)
+                    comment_enc, comment_input_len = model.template_encoder(comment, comment_input_len)
+                    anchor, positive, negative = model.evaluator(source_code_enc, source_code_len,
+                                                                 comment_enc, comment_input_len,
+                                                                 template_enc, template_len)
+
+                    loss1 = seq2seq_loss(comment_pred, comment, comment_len)
+                    loss2 = evaluator_loss(anchor, positive, negative) * 0.1
+                    loss = loss1 + loss2
+                else:
+                    comment_pred = model.deliberation_dec[iter_idx](source_code_enc.detach(), comment_input,
+                                                                    template_enc,
+                                                                    keywords_enc.detach(), source_code_len.detach(),
+                                                                    template_len, keywords_len.detach())
+                    loss = seq2seq_loss(comment_pred, comment, comment_len)
+
+                losses_list[iter_idx].append(loss.item())
+                # accumulate the grad
+                loss.backward()
+                # optimizer the parameters
+                optimizer_list[iter_idx].step()
+
+                template = torch.argmax(comment_pred.detach(), -1)
+                template_len = comment_input_len
+
+        else:
+            # 无CFG情况下与原流程相同
+            source_code, comment, template, keywords, source_code_len, comment_len, template_len, keywords_len = \
+                [d.cuda() for d in data[:8]] if cuda else data[:8]
+            # code_id = data[-1]
+            bos = torch.tensor([bos_token] * comment.size(0), device=comment.device).reshape(-1, 1)
+            comment_input = torch.cat([bos, comment[:, :-1]], 1)
+            comment_input_len = torch.add(comment_len, -1)
+            # share
+            source_code_enc, source_code_len = model.code_encoder(source_code, source_code_len)
+            keywords_enc, keywords_len = model.keyword_encoder(keywords, keywords_len)
+
+            for iter_idx in range(max_iter_num):
+                # clear the grad
+                optimizer_list[iter_idx].zero_grad()
+
+                template_enc, template_len = model.template_encoder(template, template_len)
+                if iter_idx == 0:
+                    comment_pred = model.deliberation_dec[iter_idx](source_code_enc, comment_input, template_enc,
+                                                                    keywords_enc, source_code_len, template_len,
+                                                                    keywords_len)
+                    comment_enc, comment_input_len = model.template_encoder(comment, comment_input_len)
+                    anchor, positive, negative = model.evaluator(source_code_enc, source_code_len,
+                                                                 comment_enc, comment_input_len,
+                                                                 template_enc, template_len)
+
+                    loss1 = seq2seq_loss(comment_pred, comment, comment_len)
+                    loss2 = evaluator_loss(anchor, positive, negative) * 0.1
+                    loss = loss1 + loss2
+                else:
+                    comment_pred = model.deliberation_dec[iter_idx](source_code_enc.detach(), comment_input,
+                                                                    template_enc,
+                                                                    keywords_enc.detach(), source_code_len.detach(),
+                                                                    template_len, keywords_len.detach())
+                    loss = seq2seq_loss(comment_pred, comment, comment_len)
+
+                losses_list[iter_idx].append(loss.item())
+                # accumulate the grad
+                loss.backward()
+                # optimizer the parameters
+                optimizer_list[iter_idx].step()
+
+                template = torch.argmax(comment_pred.detach(), -1)
+                template_len = comment_input_len
+
+    # 计算各轮平均 loss
+    avg_loss = [round(np.sum(losses) / len(losses), 4) for losses in losses_list]
+    return avg_loss
+
+
+def evaluate_model(model, dataloader, bos_token, commont_id2word, cuda, max_iter_num, use_cfg):
+    losses, comment_reference, ids = [], [], []
+    comment_prediction = {i: [] for i in range(max_iter_num + 1)}
+    model.eval()
+
+    seed_everything(seed)
+    with torch.no_grad():
+        for data in tqdm(dataloader, desc=f"evaluating"):
+            if use_cfg:
+                data = [d.to('cuda') if isinstance(d, torch.Tensor) else d for d in data]
+                (source_code, comment, template, keywords, cfg_adj, cfg_nodes,
+                 source_code_len, comment_len, template_len, keywords_len, cfg_len, batch_ids) = data
+                # code_id = data[-1]
+                ids += batch_ids
+            else:
+                # 无CFG情况下与原流程相同
+                (source_code, comment, template, keywords,
+                 source_code_len, comment_len, template_len, keywords_len) = [d.cuda() for d in
+                                                                                    data[:8]] if cuda else data[:8]
+                cfg_adj = cfg_nodes = cfg_len = None
+                code_id = data[-1]
+                ids += code_id
+
+            # source_code, comment, template, keywords, source_code_len, comment_len, template_len, keywords_len = \
+            #     [d.cuda() if cuda and not isinstance(d, list) else d for d in data[:8]]
+            
+
+            bos = torch.tensor([bos_token] * len(comment), device=template.device).reshape(-1, 1)
+
+            if use_cfg:
+                memories = model(
+                    source_code, bos,
+                    template, keywords,
+                    source_code_len, comment_len,
+                    template_len, keywords_len,
+                    cfg_adj, cfg_nodes, cfg_len)
+            else:
+                memories = model(
+                    source_code, bos,
+                    template, keywords,
+                    source_code_len, comment_len,
+                    template_len, keywords_len)
+
+            # ✅ 如果模型返回单个 tensor，则包装为 list，统一处理
+            # if isinstance(memories, torch.Tensor):
+            #     memories = [memories]
+            # elif not isinstance(memories, list):
+            #     raise TypeError(f"[ERROR] 模型输出类型错误，期望为 list 或 Tensor，实际为：{type(memories)}")
+
+            for i in range(len(comment)):
+                ref = comment[i]
+                # ref_tokens = [comment_id2word[int(t)] for t in ref if int(t) not in {PAD_ID, BOS_ID}]
+                comment_reference.append([ref])
+                for j, comment_pred in enumerate(memories):
+                    # 输出第 j 轮解码器的预测序列长度和示例
+                    # lengths = [len(seq) if isinstance(seq, list) else 1 for seq in comment_pred]
+                    # print(f"Round {j} predicted lengths: {lengths}")
+                    # if j == len(memories) - 1:  # 最终最佳结果
+                    #     for seq_idx, seq in enumerate(comment_pred[:5]):  # 打印前5个样本
+                    #         tokens = [commont_id2word[int(t)] for t in (seq if isinstance(seq, list) else [seq])]
+                    #         print(f"Sample{seq_idx} Predicted: {' '.join(tokens)}")
+                    #         ref_tokens = [commont_id2word[id] for id in comment[seq_idx].tolist()]
+                    #         print(f"Sample{seq_idx} Reference: {' '.join(ref_tokens)}")
+
+                    
+                    if isinstance(comment_pred[i], (int, torch.Tensor)) and not isinstance(comment_pred[i], (list, tuple)):
+                        pre = [commont_id2word[int(comment_pred[i])]]
+                    else:
+                        pre = [commont_id2word[id] for id in comment_pred[i]]
+                    # pre = [commont_id2word[id] for id in comment_pred[i]]
+                    comment_prediction[j].append(pre)
+
+            # ids += code_id
+
+    for ii, comment_pred in enumerate(comment_prediction.values()):
+        assert len(ids) == len(comment_pred) == len(comment_reference)
+        bleu, rouge, meteor, _, _ = eval_bleu_rouge_meteor(ids, comment_pred, comment_reference)
+        print("评价指标：", bleu, rouge, meteor)
+
+    return bleu, rouge, meteor, comment_prediction
+
+
+class Config(object):
+    def __init__(self, dataset_config):
+        dataset, max_code_len, max_comment_len, max_keywords_len = dataset_config.values()
+        self.cuda = True
+        self.dataset = dataset
+        with open(fr'./../dataset/{dataset}/code.word2id', 'rb') as f:
+            code_word2id = pickle.load(f)
+        with open(fr'./../dataset/{dataset}/code.id2word', 'rb') as f:
+            code_id2word = pickle.load(f)
+        with open(fr'./../dataset/{dataset}/comment.word2id', 'rb') as f:
+            comment_word2id = pickle.load(f)
+        with open(fr'./../dataset/{dataset}/comment.id2word', 'rb') as f:
+            comment_id2word = pickle.load(f)
+        self.code_word2id = code_word2id
+        self.code_id2word = code_id2word
+        self.comment_word2id = comment_word2id
+        self.comment_id2word = comment_id2word
+        self.bos_token = self.comment_word2id['<BOS>']
+        self.eos_token = self.comment_word2id['<EOS>']
+
+        self.d_model = 512
+        self.d_ff = 2048
+        self.head_num = 8
+        self.encoder_layer_num = 4
+        self.decoder_layer_num = 6
+        self.max_code_len = max_code_len
+        self.max_comment_len = max_comment_len
+        self.max_keywords_len = max_keywords_len
+        self.code_vocab_size = len(code_word2id)
+        self.comment_vocab_size = len(comment_word2id)
+        self.beam_width = 5
+        self.lr = 1e-4
+        self.fineTune_lr = 1e-5
+        self.batch_size = 32
+        self.max_iter_num = 3
+        self.dropout = 0.2
+        self.epochs = 100
+        self.clipping_distance = 16
+        self.use_cfg = True
+        self.fusion_mode = 'concat'
+
+        '''wj: 添加检查点路径配置--start'''
+        # 新增共享存储路径配置
+        self.checkpoint_dir = './../mnt/shared_storage/checkpoints/'  # 共享存储路径
+        print(f"🔄 尝试创建目录: {self.checkpoint_dir}")
+        self.best_model_path = f'./../saved_model/{self.dataset}/best_model.pth'  # 最佳模型路径
+        os.makedirs(self.checkpoint_dir, exist_ok=True)  # 自动创建目录
+        print(f"✅ 目录创建状态: {os.path.exists(self.checkpoint_dir)}")
+        print(f"📂 目录权限: {oct(os.stat(self.checkpoint_dir).st_mode)[-3:]}")
+        '''wj: 添加检查点路径配置--end'''
+
+'''wj: 添加检查点加载函数-start'''
+def load_checkpoint(checkpoint_path, model, optimizer_list, device='cuda'):
+    """
+    加载检查点并恢复训练状态
+    Args:
+        checkpoint_path: 检查点文件路径
+        model: 模型对象
+        optimizer_list: 优化器列表
+        device: 设备类型
+    Returns:
+        start_epoch: 恢复的起始epoch
+        best_valid_bleu: 恢复的最佳BLEU值
+    """
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        # 加载所有优化器状态
+        for i, optimizer in enumerate(optimizer_list):
+            optimizer.load_state_dict(checkpoint[f'optimizer_{i}_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_valid_bleu = checkpoint['best_valid_bleu']
+        print(f"Loaded checkpoint from {checkpoint_path}, resuming from epoch {start_epoch}")
+        return start_epoch, best_valid_bleu
+    else:
+        return 0, 0  # 无检查点时从头开始
+'''wj: 添加检查点加载函数--end'''
+
+
+if __name__ == '__main__':
+    jcsd_config = {'name': 'JCSD', 'max_code_len': 300, 'max_comment_len': 50, 'max_keywords_len': 30}
+    pcsd_config = {'name': 'PCSD', 'max_code_len': 100, 'max_comment_len': 50, 'max_keywords_len': 30}
+    config = Config(jcsd_config)
+    cuda = torch.cuda.is_available() and config.cuda
+    if cuda:
+        print('Running on GPU')
+    else:
+        print('Running on CPU')
+
+    seed_everything(seed)
+    print('当前的模式：', config.use_cfg , ';' , config.fusion_mode)
+
+    '''wj: 定义检查点路径--start'''
+    # 新增：定义检查点路径
+    checkpoint_path = os.path.join(config.checkpoint_dir, f'checkpoint_{config.dataset}.pth')
+    '''wj: 定义检查点路径--end'''
+
+    model = DECOM(config.d_model, config.d_ff, config.head_num, config.encoder_layer_num,
+                  config.decoder_layer_num, config.code_vocab_size, config.comment_vocab_size,
+                  config.bos_token, config.eos_token, config.max_comment_len,
+                  config.clipping_distance, config.max_iter_num, config.dropout, beam_width=4,
+                  use_cfg=config.use_cfg, fusion_mode=config.fusion_mode)
+
+    # print("load the best model parameters!")
+    # model.load_state_dict(torch.load("."))
+
+    if cuda:
+        model.cuda()
+
+    seq2seq_loss = MaskedSoftmaxCELoss()
+    evaluator_loss = DAMSMLoss()
+
+    optimizer0 = optim.Adam([{'params': [param for name, param in model.named_parameters()
+                                         if 'deliberation_dec' not in name or 'deliberation_dec.0' in name]}], lr=config.lr)
+    optimizer_list = [optim.Adam(
+        [{'params': [param for name, param in model.named_parameters() if f'deliberation_dec.{i}' in name]}], lr=config.lr)
+        for i in range(1, config.max_iter_num)]
+
+    optimizer_list = [optimizer0] + optimizer_list
+
+    '''wj: 尝试加载检查点--start'''
+    # 新增：尝试加载检查点
+    start_epoch, best_valid_bleu = load_checkpoint(checkpoint_path, model, optimizer_list, 'cuda' if cuda else 'cpu')
+    print(f"🏁 开始训练，起始 epoch: {start_epoch}")
+    '''wj: 尝试加载检查点--end'''
+
+    print("get_parameter_number",get_parameter_number(model))
+    train_loader, valid_loader, test_loader = get_loaders(config.code_word2id, config.comment_word2id, config.dataset,
+                                                          config.max_code_len, config.max_comment_len, config.max_keywords_len,
+                                                          config.batch_size, num_workers=0, pin_memory=False, use_cfg=config.use_cfg)
+
+    last_improve = 0
+    best_valid_bleu = 0
+    best_test_bleu = 0
+    print("current_dataset:", config.dataset)
+
+    '''wj:  # 原代码行：for e in range(config.epochs):
+            # 修改为支持断点续训的循环起始点'''
+    for e in range(start_epoch, config.epochs):
+        start_time = time.time()
+
+        # 1.step training
+        train_loss = train_locally(model, seq2seq_loss, evaluator_loss, train_loader, config.bos_token,
+                                   optimizer_list, e, cuda, config.max_iter_num, config.use_cfg)
+        print('epoch:{},train_loss:{},time:{}sec'.format(e + 1, train_loss, round(time.time() - start_time, 2)))
+
+        if (e + 1) % 5 == 0 or e >= 55:
+            # validation
+            valid_bleu, valid_rouge, valid_meteor, valid_prediction = \
+                evaluate_model(model, test_loader, config.bos_token, config.comment_id2word, cuda, config.max_iter_num, config.use_cfg)
+
+            print('epoch:{},valid_bleu:{},valid_rouge:{},valid_meteor:{},time:{}sec'.
+                  format(e + 1, valid_bleu, valid_rouge, valid_meteor, round(time.time() - start_time, 2)))
+
+            if valid_bleu > best_valid_bleu:
+                best_valid_bleu = valid_bleu
+                last_improve = e
+
+                # save the best model parameters
+                '''wj: 创建saved_model文件目录'''
+                os.makedirs(os.path.join("./../saved_model", config.dataset), exist_ok=True)
+                torch.save(model.state_dict(), f"./../saved_model/{config.dataset}/first_step_params.pkl")
+                '''wj: 修改模型保存路径到共享存储'''
+                torch.save(model.state_dict(), config.best_model_path)
+                print(f"💾 保存最佳模型到 {config.best_model_path}")
+                # output the prediction of comments for test set
+                for ii, comment_pred in enumerate(valid_prediction.values()):
+                    '''wj: 创建results文件目录'''
+                    os.makedirs(f'./../results/{config.dataset}', exist_ok=True)
+                    with open(f'./../results/{config.dataset}/first_step_result.{ii}', 'w') as w:
+                        for comment_list in comment_pred:
+                            comment = ' '.join(comment_list)
+                            w.write(comment + '\n')
+
+            if e - last_improve >= 20:
+                print("No optimization for 20 epochs, auto-stopping and save model parameters")
+                break
+
+        '''wj: 每个epoch保存检查点'''
+        checkpoint = {
+            'epoch': e,
+            'model_state_dict': model.state_dict(),
+            'best_valid_bleu': best_valid_bleu,
+            **{f'optimizer_{i}_state_dict': opt.state_dict() for i, opt in enumerate(optimizer_list)}
+        }
+        torch.save(checkpoint, checkpoint_path)
+        print(f"🔖 保存检查点到 {checkpoint_path} (epoch {e + 1})")
+
+    print("finish!!!")
+    print("best_valid_bleu:", best_valid_bleu)
+    print("best_test_bleu:", best_test_bleu)
