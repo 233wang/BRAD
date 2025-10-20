@@ -1,6 +1,6 @@
 # BRIDGE
 This is a replication package for `BRIDGE: Enhancing Code Comment Generation with Bytecode CFG Graph Encoding and Retrieval-Augmented DECOME`. 
-Our project is public at: <>
+Our project is public at: <https://github.com/233wang/BRIDGE.git>
 
 ## Content
 1. [Get Started](#1-Get-Started)<br>
