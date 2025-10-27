@@ -1,6 +1,5 @@
 # BRIDGE
-This is a replication package for `BRIDGE: Enhancing Code Comment Generation with Bytecode CFG Graph Encoding and Retrieval-Augmented DECOME`. 
-Our project is public at: <https://github.com/233wang/BRIDGE.git>
+This is a replication package for `BRAD: Enhancing Code summarization with Bytecode Retrieval-Augmented Deliberation model`. 
 
 ## Content
 1. [Get Started](#1-Get-Started)<br>
@@ -37,16 +36,16 @@ BRIDGE is evaluated on [JCSD](https://github.com/sdfdfx/TSE) benchmark datasets.
 cd src/
 python build_vocab.py
 ```
-2. Train DECOM model by performing a two-step training strategy:
+2. Train model by performing a two-step training strategy:
 ```
 python train_locally.py
 python train_FineTune.py
 ```
-3. Test DECOM model:
+3. Test  model:
 ```
 python prediction.py
 ```
-4. Switch to python 2.7 environment and evaluate the performance of DECOM:
+4. Switch to python 2.7 environment and evaluate the performance of model:
 ```
 cd rencos_evaluation/
 python evaluate.py

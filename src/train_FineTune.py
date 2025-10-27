@@ -58,20 +58,13 @@ def get_loaders(code_word2id, comment_word2id, dataset, max_code_len, max_commen
 
 
 def train_FineTune(model, seq2seq_loss, evaluator_loss, dataloader, bos_token, optimizer, epoch, cuda, max_iter_num, use_cfg):
-    """
-    对模型进行第二阶段微调：在第1阶段训练基础上，
-    微调整个模型参数，支持CFG模块和多轮审议。
-    返回每轮的平均 loss。
-    """
-    # losses_list 用于存储每一轮 seq2seq loss 以及 evaluator loss
+
+
     losses_list = [[] for _ in range(max_iter_num + 1)]
     model.train()
 
     seed_everything(seed + epoch)
     for data in tqdm(dataloader, desc=f"Epoch {epoch+1} FineTune"):
-        # source_code, comment, template, keywords, source_code_len, comment_len, template_len, keywords_len = \
-        #     [d.cuda() for d in data[:8]] if cuda else data[:8]
-        # ===== 解包 batch，包括可选的 CFG =====
         if use_cfg:
             data = [d.to('cuda') if isinstance(d, torch.Tensor) else d for d in data]
             (source_code, comment, template, keywords, cfg_adj, cfg_nodes,
@@ -84,18 +77,14 @@ def train_FineTune(model, seq2seq_loss, evaluator_loss, dataloader, bos_token, o
                 d.cuda() for d in data[:8]
             ) if cuda else data[:8]
             cfg_adj = cfg_nodes = cfg_len = None
-        # code_id = data[-1]
-        '''wj:新修改代码-start'''
-        # ===== 准备 Decoder 的 teacher forcing 输入 =====
+
         B = comment.size(0)
         bos = torch.full((B, 1), bos_token,
                          dtype=torch.long,
                          device=comment.device)
-        # 输入 = <BOS> + 真值评论的前 L-1 个 token
         comment_input = torch.cat([bos, comment[:, :-1]], dim=1)
         comment_input_len = comment_len - 1
 
-        # ===== 前向计算 =====
         optimizer.zero_grad()
         if use_cfg:
             memories, anchor, positive, negative = model(
@@ -113,54 +102,20 @@ def train_FineTune(model, seq2seq_loss, evaluator_loss, dataloader, bos_token, o
                 template_len, keywords_len
             )
 
-        # ===== 计算损失 =====
         total_loss = None
-        # seq2seq 多轮 loss
         for i in range(max_iter_num):
             loss_i = seq2seq_loss(memories[i], comment, comment_len)
             losses_list[i].append(loss_i.item())
             total_loss = loss_i if total_loss is None else total_loss + loss_i
-        # evaluator loss 加权
         loss_e = evaluator_loss(anchor, positive, negative) * 0.1
         losses_list[-1].append(loss_e.item())
         total_loss = total_loss + loss_e
 
-        # ===== 反向传播 + 优化 =====
         total_loss.backward()
         optimizer.step()
 
-    # ===== 统计平均 loss =====
     avg_loss = [round(np.mean(lst), 4) if lst else 0.0
                 for lst in losses_list]
-    '''wj:新修改代码-end'''
-    # 原始代码
-    #     bos = torch.tensor([bos_token] * comment.size(0), device=comment.device).reshape(-1, 1)
-    #     comment_input = torch.cat([bos, comment[:, :-1]], 1)
-    #     comment_input_len = torch.add(comment_len, -1)
-    #
-    #     optimizer.zero_grad()
-    #     memory, anchor, positive, negative = model(source_code, comment_input, template, keywords,
-    #                                                source_code_len, comment_input_len, template_len, keywords_len)
-    #
-    #     loss = None
-    #     for iter_idx in range(max_iter_num):
-    #         loss_idx = seq2seq_loss(memory[iter_idx], comment, comment_len)
-    #         losses_list[iter_idx].append(loss_idx.item())
-    #         if loss is None:
-    #             loss = loss_idx
-    #         else:
-    #             loss += loss_idx
-    #
-    #     loss_e = evaluator_loss(anchor, positive, negative) * 0.1
-    #     losses_list[-1].append(loss_e.item())
-    #
-    #     loss += loss_e
-    #     # accumulate the grad
-    #     loss.backward()
-    #     # optimizer the parameters
-    #     optimizer.step()
-    #
-    # avg_loss = [round(np.sum(losses) / len(losses), 4) for losses in losses_list]
 
     return avg_loss
 
@@ -177,9 +132,7 @@ def evaluate_model(model, dataloader, bos_token, commont_id2word, cuda, max_iter
                 data = [d.to('cuda') if isinstance(d, torch.Tensor) else d for d in data]
                 (source_code, comment, template, keywords, cfg_adj, cfg_nodes,
                  source_code_len, comment_len, template_len, keywords_len, cfg_len, code_id) = data
-                # code_id = data[-1]
             else:
-                # 无CFG情况下与原流程相同
                 (source_code, comment, template, keywords,
                  source_code_len, comment_len, template_len, keywords_len) = [d.cuda() for d in
                                                                               data[:8]] if cuda else data[:8]
@@ -210,7 +163,6 @@ def evaluate_model(model, dataloader, bos_token, commont_id2word, cuda, max_iter
                         pre = [commont_id2word[int(comment_pred[i])]]
                     else:
                         pre = [commont_id2word[id] for id in comment_pred[i]]
-                    # pre = [common_id2word[id] for id in comment_pred[i]]
                     comment_prediction[j].append(pre)
 
             ids += code_id
@@ -266,7 +218,6 @@ class Config(object):
 
 
 if __name__ == '__main__':
-    print("开始第二阶段训练")
     jcsd_config = {'name': 'JCSD', 'max_code_len': 300, 'max_comment_len': 50, 'max_keywords_len': 30}
     pcsd_config = {'name': 'PCSD', 'max_code_len': 100, 'max_comment_len': 50, 'max_keywords_len': 30}
     config = Config(jcsd_config)

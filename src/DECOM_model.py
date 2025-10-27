@@ -43,36 +43,23 @@ def masked_softmax(X, valid_lens):
     """Perform softmax operation by masking elements on the last axis.
 
     Defined in :numref:`sec_attention-scoring-functions`"""
-    # `X`: 3D tensor, `valid_lens`: 1D or 2D tensor
-#     if valid_lens is None:
-#         return nn.functional.softmax(X, dim=-1)
-#     else:
-#         shape = X.shape
-#         if valid_lens.dim() == 1:
-#             valid_lens = torch.repeat_interleave(valid_lens, shape[1])
-#         else:
-#             valid_lens = valid_lens.reshape(-1)
-#         # On the last axis, replace masked elements with a very large negative
-#         # value, whose exponentiation outputs 0
-#         X = sequence_mask(X.reshape(-1, shape[-1]), valid_lens, value=-1e6)
-#         return nn.functional.softmax(X.reshape(shape), dim=-1)
 
-    """在最后一维做 softmax，同时屏蔽掉超出 valid_lens 的位置。"""
+
     # X: （batch_heads, Q, K）
     if valid_lens is None:
         return torch.softmax(X, dim=-1)
     shape = X.shape  # (batch_heads, Q, K)
-    # valid_lens 可以是 1D: (batch_heads,) 或 2D: (batch_heads, Q)
+
     if valid_lens.dim() == 1:
         # (batch_heads,) -> (batch_heads*Q,)
         valid_lens = valid_lens.repeat_interleave(shape[1])
     else:
         # (batch_heads, Q) -> (batch_heads*Q,)
         valid_lens = valid_lens.reshape(-1)
-    # 均一化到 2D
+
     X_flat = X.reshape(-1, shape[-1])  # (batch_heads*Q, K)
-    valid_lens = valid_lens.to(X_flat.device)  # 防止 device 不一致
-    # 屏蔽
+    valid_lens = valid_lens.to(X_flat.device)
+
     X_masked = sequence_mask(X_flat, valid_lens, value=-1e6)
     return torch.softmax(X_masked.reshape(shape), dim=-1)
 
@@ -81,17 +68,8 @@ def sequence_mask(X, valid_len, value=0):
     """Mask irrelevant entries in sequences.
 
     Defined in :numref:`sec_seq2seq_decoder`"""
-#     maxlen = X.size(1)
-#     mask = torch.arange((maxlen), dtype=torch.float32,
-#                         device=X.device)[None, :] < valid_len[:, None]
-#     X[~mask] = value
-#     return X
-    """
-    对 X 进行序列掩码，将超过 valid_len 的部分替换为 value。
-    X: shape = [B, T]
-    valid_len: shape = [B]，表示每一行的有效长度
-    """
-    maxlen = X.size(1)  # 第二维度作为掩码上限
+
+    maxlen = X.size(1)
     mask = torch.arange(maxlen, device=X.device)[None, :].expand(X.size(0), maxlen)
     valid_len = valid_len[:, None].expand_as(mask)
     X[mask >= valid_len] = value
@@ -325,13 +303,10 @@ class Encoder(nn.Module):
     def __init__(self, d_model, d_ff, head_num, N=6, dropout=0.1):
         super(Encoder, self).__init__()
         self.d_model = d_model
-        # self.embedding = nn.Embedding(vocab_size, d_model)
-        # self.pos_encoding = PositionalEncoding(d_model, dropout)
         self.layers = nn.ModuleList([EncoderBlock(d_model, d_ff, head_num, dropout) for _ in range(N)])
 
     def forward(self, x, valid_lens):
-        # encoder编码时,输入x是CNN输出的embedding
-        # x = self.pos_encoding(self.embedding(x) * math.sqrt(self.d_model))
+
         for layer in self.layers:
             x = layer(x, valid_lens)
 
@@ -359,22 +334,16 @@ class EncoderWithRPR(nn.Module):
     def __init__(self, d_model, d_ff, head_num, clipping_distance, N=6, dropout=0.1):
         super(EncoderWithRPR, self).__init__()
         self.d_model = d_model
-        # self.embedding = nn.Embedding(vocab_size, d_model)
-        # self.pos_encoding = PositionalEncoding(d_model, dropout)
         self.layers = nn.ModuleList(
             [EncoderBlockWithRPR(d_model, d_ff, head_num, clipping_distance, dropout) for _ in range(N)])
 
     def forward(self, x, valid_lens):
-        # encoder编码时,输入x是CNN输出的embedding
-        # x = self.pos_encoding(self.embedding(x) * math.sqrt(self.d_model))
+
         for layer in self.layers:
             x = layer(x, valid_lens)
 
         return x
 
-# -----------------------
-# 修改: DecoderBlockWithKeywords 增加 CFG 融合门控
-# -----------------------
 class DecoderBlockWithKeywords(nn.Module):
     def __init__(self, i, d_model, d_ff, head_num, dropout=0.1, use_cfg=False, fusion_mode = 'concat'):
         super(DecoderBlockWithKeywords, self).__init__()
@@ -385,7 +354,6 @@ class DecoderBlockWithKeywords(nn.Module):
         self.cross_attention_code = MultiHeadAttention(d_model, d_model, d_model, d_model, head_num, dropout)
         self.cross_attention_template = MultiHeadAttention(d_model, d_model, d_model, d_model, head_num, dropout)
         self.cross_attention_keywords = MultiHeadAttention(d_model, d_model, d_model, d_model, head_num, dropout)
-        # self.gate = nn.Linear(d_model + d_model, 1)
         if self.use_cfg and self.fusion_mode == 'gate':
             self.cross_attention_cfg = MultiHeadAttention(d_model, d_model, d_model, d_model, head_num, dropout)
             self.gate_cg = nn.Linear(d_model * 2, 1)
@@ -412,9 +380,7 @@ class DecoderBlockWithKeywords(nn.Module):
         if prev is None:
             key_values = x
         else:
-#             key_values = torch.cat((state[6][self.i], x), axis=1)
             key_values = torch.cat((prev, x), dim=1)
-        # state[6][self.i] = key_values
         memories[self.i] = key_values
         if self.training:
             batch_size, num_steps, _ = x.shape
@@ -422,11 +388,9 @@ class DecoderBlockWithKeywords(nn.Module):
         else:
             dec_valid_lens = None
 
-        # 1. self attention
+
         x2 = self.masked_self_attention(x, key_values, key_values, dec_valid_lens)
         y = self.add_norm1(x, x2)
-        # 2. cross attention
-        # 跨注意力: 代码 vs (代码+CFG) vs 关键词
         y2_code = self.cross_attention_code(y, source_code_enc, source_code_enc, source_code_len)
         if self.use_cfg and self.fusion_mode == 'gate':
             y2_cfg = self.cross_attention_cfg(y, cfg_enc, cfg_enc, cfg_len)
@@ -441,9 +405,7 @@ class DecoderBlockWithKeywords(nn.Module):
             gate_weight = torch.sigmoid(self.gate(torch.cat([y2_code, y2_keyword], dim=-1)))
             y2 = gate_weight * y2_code + (1. - gate_weight) * y2_keyword
         z = self.add_norm2(y, y2)
-        # 3. cross attention
         z2 = self.cross_attention_template(z, template_enc, template_enc, template_len)
-        # z2 = z2_keywords + z2_template
         z_end = self.add_norm3(z, z2)
         return self.add_norm4(z_end, self.feedForward(z_end)), state
 
@@ -610,7 +572,6 @@ class KeywordsGuidedDecoder(nn.Module):
             comment_embed = self.pos_encoding(self.comment_embedding(comment), comment_pos)
 
             comment_pred = self.comment_decoder(comment_embed, dec_state)[0]
-#             print(f"[CHECK] beam/greeed search 输出：{comment_pred}")
             return comment_pred
         else:
             if self.beam_width:
@@ -634,19 +595,18 @@ class KeywordsGuidedDecoder(nn.Module):
         return comment_pred
 
     def beam_search(self, batch_size, comment, dec_state, beam_width):
-        # comment -> batch * 1
-        # first node
+
         node_list = []
-        batchNode_dict = {i: None for i in range(beam_width)}  # 每个时间步都只保留beam_width个node
-        # initialization
+        batchNode_dict = {i: None for i in range(beam_width)}
+
         for batch_idx in range(batch_size):
             node_comment = comment[batch_idx].unsqueeze(0)
             if self.use_cfg and self.fusion_mode == 'gate':
                 node_dec_state = [dec_state[0][batch_idx].unsqueeze(0), dec_state[1][batch_idx].unsqueeze(0),
                                   dec_state[2][batch_idx].unsqueeze(0), dec_state[3][batch_idx].unsqueeze(0),
                                   dec_state[4][batch_idx].unsqueeze(0), dec_state[5][batch_idx].unsqueeze(0),
-                                  dec_state[6][batch_idx].unsqueeze(0),  # cfg_enc for this sample
-                                  dec_state[7][batch_idx].unsqueeze(0),  # cfg_len for this sample
+                                  dec_state[6][batch_idx].unsqueeze(0),
+                                  dec_state[7][batch_idx].unsqueeze(0), 
                                   [None] * self.num_layers
                                  ]
             else:
@@ -667,18 +627,17 @@ class KeywordsGuidedDecoder(nn.Module):
                     continue
 
                 batchNode = batchNode_dict[idx]
-                # comment -> batch * 1
+
                 comment = batchNode.get_comment()
                 dec_state = batchNode.get_dec_state()
 
-                # decode for one step using decoder
+
                 pos = torch.arange(pos_idx, pos_idx + 1, device=comment.device).repeat(batch_size, 1)
-                # comment -> batch * d_model
+
                 comment = self.pos_encoding(self.comment_embedding(comment), pos)
                 tensor, dec_state = self.comment_decoder(comment, dec_state)
                 tensor = F.log_softmax(tensor.squeeze(1), -1).detach()
-                # PUT HERE REAL BEAM SEARCH OF TOP
-                # log_prob, comment_candidates -> batch * beam_width
+
                 log_prob, comment_candidates = torch.topk(tensor, beam_width, dim=-1)
 
                 for batch_idx in range(batch_size):
@@ -729,28 +688,16 @@ class KeywordsGuidedDecoder(nn.Module):
 
         return comment_pred
 
-'''wj: 新增基于图注意力网络的CFG编码器--开始'''
-# -----------------------
-# 新增: CFGEncoder (基于GAT)
-# -----------------------
+
 class CFGEncoder(nn.Module):
     def __init__(self, code_embedding, d_model, num_heads=4, num_layers=2, dropout=0.1):
-        """
-        基于图注意力网络的CFG编码器。
-        :param code_embedding: 用于将节点token映射为embedding的共享嵌入层
-        :param d_model: 节点特征和输出向量的维度
-        :param num_heads: 多头注意力的头数
-        :param num_layers: 图注意力层数
-        :param dropout: 丢弃率
-        """
+
         super(CFGEncoder, self).__init__()
-        self.code_embedding = code_embedding  # 共享代码嵌入层
+        self.code_embedding = code_embedding
         self.d_model = d_model
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.dropout = nn.Dropout(dropout)
-        # 图注意力层的参数：每一层为多头注意力，以下简化实现为单层，多头通过参数重复实现
-        # 为每个注意力头定义线性变换和注意力系数参数
         self.W = nn.ModuleList([
             nn.ModuleList([
                 nn.Linear(d_model, d_model // num_heads, bias=False)
@@ -763,135 +710,74 @@ class CFGEncoder(nn.Module):
         self.attn_a_dst = nn.ParameterList([nn.Parameter(torch.zeros(size=(d_model // num_heads, 1)))
                                             for _ in range(num_heads * num_layers)])
 
-        # 3. 多层残差后归一化
+
         self.norms = nn.ModuleList([
             nn.LayerNorm(d_model)
             for _ in range(num_layers)
         ])
-        # 4. Dropout 用于 attention 权重和特征输出
+
         self.attn_dropout = nn.Dropout(dropout)
         self.out_dropout = nn.Dropout(dropout)
 
-        # 参数初始化
+
         self._reset_parameters()
 
     def _reset_parameters(self):
-        # Xavier 初始化每个头的线性映射
+
         for layer_w in self.W:
             for head_lin in layer_w:
                 nn.init.xavier_uniform_(head_lin.weight)
-        # 初始化注意力向量
+
         for param in self.attn_a_src:
             nn.init.xavier_uniform_(param.data)
         for param in self.attn_a_dst:
             nn.init.xavier_uniform_(param.data)
 
     def forward(self, cfg_adj, cfg_nodes, cfg_len):
-        """
-        :param cfg_adj: 张量(batch_size, N, N)，CFG的邻接矩阵，1表示存在边（控制流），0表示无边
-        :param cfg_nodes: 张量(batch_size, N, L)，每个节点的token序列ID（已填充PAD到长度L）
-        :param cfg_len: 张量(batch_size)，每个样本的节点数量（不含PAD的节点）
-        :return: cfg_enc: 张量(batch_size, N, d_model)，每个节点的编码表示
-        """
-        # 1. 将节点的token序列转换为初始节点向量表示
-        # 使用共享的代码嵌入层对节点tokens编码，然后对节点内tokens取平均得到节点初始特征
+
         batch_size, max_nodes, max_token_len = cfg_nodes.size()
-        # shape (batch_size, max_nodes, max_token_len, d_model)
+
         node_token_embed = self.code_embedding(cfg_nodes)
-        # 对每个节点的token维度取平均，得到节点向量 (batch_size, max_nodes, d_model)
         node_feat = torch.mean(node_token_embed, dim=2)
-        node_feat = self.dropout(node_feat)  # dropout防止过拟合
+        node_feat = self.dropout(node_feat)
 
-        # 2. 图注意力层迭代更新节点表示
-        # 为简洁起见，这里将num_layers层的GAT展开在一起，每层num_heads注意力头
-        # cfg_enc = node_feat  # 初始节点表示
-        # for layer in range(self.num_layers):
-        #     # 本层的输出初始化
-        #     new_node_feats = []
-        #     # 对于每个注意力头，独立计算新的节点特征，然后在最后Concat
-        #     for head in range(self.num_heads):
-        #         head_index = layer * self.num_heads + head
-        #         Wh = self.W[head_index](cfg_enc)  # 对节点特征做线性变换 (batch, N, d_model/num_heads)
-        #         # 计算注意力系数 e_ij = LeakyReLU(a^T [Wh_i || Wh_j]) 对于每条边(i,j)
-        #         # 先计算 a_src^T * Wh_i 和 a_dst^T * Wh_j
-        #         a_src = self.attn_a_src[head_index]  # (d_model/num_heads, 1)
-        #         a_dst = self.attn_a_dst[head_index]  # (d_model/num_heads, 1)
-        #         # e_i = a_src^T * Wh  -> shape (batch, N, 1)
-        #         e_i = torch.matmul(Wh, a_src)
-        #         # e_j = a_dst^T * Wh  -> shape (batch, N, 1)
-        #         e_j = torch.matmul(Wh, a_dst)
-        #         # 利用广播求 e_ij = LeakyReLU(e_i + e_j^T)
-        #         # 先将 e_i 扩展为 (batch, N, N), e_j 扩展为 (batch, N, N)
-        #         e_i_expand = e_i.expand(-1, -1, cfg_enc.size(1))
-        #         e_j_expand = e_j.expand(-1, cfg_enc.size(1), -1)
-        #         e = F.leaky_relu(e_i_expand + e_j_expand, negative_slope=0.2)  # (batch, N, N)
-        #         # Mask: 对无连接的节点对赋极小值以防影响softmax（邻接矩阵为0的位置）
-        #         # 包括超出实际节点数的填充节点也mask掉
-        #         # 创建mask: 有边或同一节点(i==j)的为0，否则为-inf
-        #         attn_mask = torch.where(cfg_adj > 0, torch.zeros_like(e), torch.full_like(e, float('-inf')))
-        #         # (可选)加入自环，即允许节点关注自身: 将对角线位置设为0（确保不被mask）
-        #         eye_mask = torch.eye(cfg_enc.size(1), device=cfg_adj.device).unsqueeze(0).expand(batch_size, -1, -1)
-        #         attn_mask = torch.where(eye_mask==1, torch.zeros_like(attn_mask), attn_mask)
-        #         # 计算注意力权重 α_ij = softmax(e_ij) 在每个节点i的邻居j上
-        #         attn_weights = F.softmax(e + attn_mask, dim=-1)  # (batch, N, N)
-        #         # 对注意力权重应用dropout
-        #         attn_weights = self.dropout(attn_weights)
-        #         # 计算加权和: h_i' = sum_j α_ij * Wh_j
-        #         h_prime = torch.bmm(attn_weights, Wh)  # (batch, N, d_model/num_heads)
-        #         new_node_feats.append(h_prime)
-        #     # 多头输出拼接
-        #     cfg_enc = torch.cat(new_node_feats, dim=-1)  # 恢复维度 (batch, N, d_model)
-
-        # 把原名映射到内部变量
         adj_matrix = cfg_adj
         node_lens = cfg_len
 
-        h = node_feat  # 初始节点特征
+        h = node_feat
 
-        # 遍历每一层 GAT
+
         for layer_idx in range(self.num_layers):
             head_outputs = []
             for head_idx in range(self.num_heads):
-                # 全局索引：layer * num_heads + head
                 idx = layer_idx * self.num_heads + head_idx
-
-                # 线性映射到 head 维度
                 Wh = self.W[layer_idx][head_idx](h)  # (batch, N, head_dim)
 
-                # 计算注意力系数 e_ij
-                # Broadcasting:  a_src^T Wh_i + a_dst^T Wh_j
                 a_src = self.attn_a_src[idx]
                 a_dst = self.attn_a_dst[idx]
-                # Wh shape: (batch, N, head_dim)
-                # e_ij = LeakyReLU(Wh_i @ a_src + Wh_j @ a_dst)
-                Wh_i = Wh.unsqueeze(2)  # (batch, N, 1, head_dim)
-                Wh_j = Wh.unsqueeze(1)  # (batch, 1, N, head_dim)
+
+                Wh_i = Wh.unsqueeze(2)
+                Wh_j = Wh.unsqueeze(1)
                 e = F.leaky_relu((Wh_i @ a_src).squeeze(-1)
                                  + (Wh_j @ a_dst).squeeze(-1),
                                  negative_slope=0.2)
 
-                # 用 adj_matrix 屏蔽无边连接
                 I = torch.eye(adj_matrix.size(-1), device=adj_matrix.device).unsqueeze(0)
                 adj_matrix = (adj_matrix + I).clamp(max=1)
                 mask = (adj_matrix == 0)
                 e = e.masked_fill(mask, float('-inf'))
 
-                # 软max 得到注意力权重
                 alpha = F.softmax(e, dim=-1)
                 alpha = self.attn_dropout(alpha)
 
-                # 聚合邻居特征
-                h_prime = alpha @ Wh  # (batch, N, head_dim)
+                h_prime = alpha @ Wh
                 head_outputs.append(h_prime)
 
-            # 拼接所有 heads 输出
             h_cat = torch.cat(head_outputs, dim=-1)  # (batch, N, d_model)
             h_cat = self.out_dropout(h_cat)
 
-            # 残差连接 + LayerNorm
             h = self.norms[layer_idx](h + h_cat)
         return h, node_lens
-'''wj: 新增基于图注意力网络的CFG编码器--结束'''
 
 class DECOM(nn.Module):
     def __init__(self, d_model, d_ff, head_num, encoder_layer_num, decoder_layer_num, code_vocab_size,
@@ -908,16 +794,14 @@ class DECOM(nn.Module):
                                                encoder_layer_num, dropout)
         self.template_encoder = TemplateEncoder(self.comment_embedding, self.pos_encoding, d_model, d_ff, head_num,
                                                 encoder_layer_num, dropout)
-        # wj:【新增】如果开启CFG功能，初始化CFG编码器
         self.use_cfg = use_cfg
         self.fusion_mode = fusion_mode
         self.bos_token = bos_token
         self.eos_token = eos_token
         if self.use_cfg:
-            # 使用共享的code_embedding，将CFG节点编码为与代码相同维度的向量
             self.cfg_encoder = CFGEncoder(self.code_embedding, d_model, num_heads=head_num, num_layers=1,
                                           dropout=dropout)
-        # 解码器和评价器初始化保持不变
+
         self.deliberation_dec = nn.ModuleList(
             [KeywordsGuidedDecoder(self.comment_embedding, self.pos_encoding, d_model, d_ff, head_num,
                                    decoder_layer_num, comment_vocab_size, bos_token, eos_token, max_comment_len,
@@ -936,17 +820,13 @@ class DECOM(nn.Module):
 
     def forward(self, source_code, comment, template, keywords,
                 source_code_len, comment_len, template_len, keywords_len, cfg_adj=None, cfg_nodes=None, cfg_len=None):
-        # 1. 编码源代码、关键词、相似示例（模板）
         src_enc, src_len = self.code_encoder(source_code, source_code_len)
         kw_enc, kw_len = self.keyword_encoder(keywords, keywords_len)
         tmpl_enc, tmpl_len = self.template_encoder(template, template_len)
-        # 2. 如果使用CFG，则编码CFG
         if self.use_cfg:
-            # 利用CFGEncoder获取图节点表示
-            cfg_enc, cfg_len = self.cfg_encoder(cfg_adj, cfg_nodes, cfg_len)  # shape (batch, N, d_model)
+            cfg_enc, cfg_len = self.cfg_encoder(cfg_adj, cfg_nodes, cfg_len)
         else:
             cfg_enc, cfg_len = None, None
-        # 3. 融合策略
         if self.use_cfg and self.fusion_mode == 'concat':
             src_comb = torch.cat([src_enc, cfg_enc], dim=1)
             len_comb = src_len + cfg_len
@@ -958,12 +838,10 @@ class DECOM(nn.Module):
         else:
             dec_src, dec_src_len = src_enc, src_len
 
-        # 训练 vs 推理
         batch = comment.size(0)
         bos = torch.full((batch, 1), self.bos_token, dtype=torch.long, device=comment.device)
-        # teacher forcing 输入
         comment_in = torch.cat([bos, comment[:, :-1]], dim=1)
-        # 4. 解码阶段
+
         if self.training:
             comment_enc, comment_len = self.template_encoder(comment[:, 1:], comment_len)
             anchor, positive, negative = self.evaluator(dec_src, dec_src_len, comment_enc, comment_len, tmpl_enc, tmpl_len)
@@ -989,7 +867,7 @@ class DECOM(nn.Module):
                     template = torch.argmax(comment_pred.detach(), -1)
                     tmpl_len = comment_len
                     tmpl_enc, tmpl_len = self.template_encoder(template, tmpl_len)
-        #推理
+
         else:
             if self.use_cfg and self.fusion_mode == 'gate':
                 memory = []
@@ -1070,22 +948,19 @@ class BatchNodeWithKeywords(object):
 
     def get_dec_state(self):
         dec_state_list = [node.dec_state for node in self.list_node]
-        # 1) 拼接基础编码部分（前6项总是存在）
         batch_dec_state = [torch.cat([batch_state[0] for batch_state in dec_state_list], dim=0),
                            torch.cat([batch_state[1] for batch_state in dec_state_list], dim=0),
                            torch.cat([batch_state[2] for batch_state in dec_state_list], dim=0),
                            torch.cat([batch_state[3] for batch_state in dec_state_list], dim=0),
                            torch.cat([batch_state[4] for batch_state in dec_state_list], dim=0),
                            torch.cat([batch_state[5] for batch_state in dec_state_list], dim=0)]
-        # batch_dec_state = [torch.cat([batch_state[i] for batch_state in dec_state_list], dim=0) for i in range(6)]
-         # 2) 如果有CFG部分（state长度大于7），拼接cfg_enc和cfg_len
         if len(dec_state_list[0]) > 7:
             batch_dec_state.append(torch.cat([batch_state[6] for batch_state in dec_state_list], dim=0))  # cfg_encs
             batch_dec_state.append(torch.cat([batch_state[7] for batch_state in dec_state_list], dim=0))  # cfg_lens
             memory_index = 8
         else:
             memory_index = 6
-        # 3) 拼接memory列表。注意memory_list本身是一个包含num_layers个张量的list
+
         if dec_state_list[0][memory_index][0] is None:
             batch_dec_state.append(dec_state_list[0][memory_index][:])
         else:

@@ -69,9 +69,7 @@ def evaluate_model(model, dataloader, bos_token, common_id2word, cuda, max_iter_
                 data = [d.to('cuda') if isinstance(d, torch.Tensor) else d for d in data]
                 (source_code, comment, template, keywords, cfg_adj, cfg_nodes,
                  source_code_len, comment_len, template_len, keywords_len, cfg_len, code_id) = data
-                # code_id = data[-1]
             else:
-                # 无CFG情况下与原流程相同
                 (source_code, comment, template, keywords,
                  source_code_len, comment_len, template_len, keywords_len) = [d.cuda() for d in
                                                                               data[:8]] if cuda else data[:8]
@@ -173,7 +171,6 @@ if __name__ == '__main__':
     print("load the best model parameters!")
     model.load_state_dict(torch.load(f"./../saved_model/{config.dataset}/second_step_params.pkl"))
 
-    # 模型装载至cuda
     if cuda:
         model.cuda()
 

@@ -1,7 +1,6 @@
 import math
 from collections import defaultdict
 
-'''wj: 配置下路径'''
 import sys
 import os
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -175,7 +174,6 @@ if __name__ == '__main__':
             comment_pred.append(comment_list[1:-1])
         else:
             comment_pred.append(comment_list[1:])
-        # comment_pred.append(line.strip().split(' '))
         ids.append(i)
 
     with open('./dataset/java/test/javadoc.original', 'r') as f:
